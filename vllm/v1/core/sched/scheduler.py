@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -25,7 +26,8 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
-from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
+from vllm.v1.core.sched.request_queue import (CSJFRequestQueue,
+                                              SchedulingPolicy,
                                               create_request_queue)
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
@@ -118,12 +120,35 @@ class Scheduler(SchedulerInterface):
             self.policy = SchedulingPolicy.PRIORITY
         elif self.scheduler_config.policy == "fcfs":
             self.policy = SchedulingPolicy.FCFS
+        elif self.scheduler_config.policy == "csjf":
+            self.policy = SchedulingPolicy.CSJF
         else:
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}")
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # --- CSJF (PrefillOnly, SOSP'25) configuration ----------------------
+        # Tunable via env vars so we don't have to extend SchedulerConfig
+        # for every ablation dial. Only read once at init.
+        #   VLLM_CSJF_FAIRNESS : float, lambda in paper Alg.1 (default 500.0)
+        #   VLLM_CSJF_MODE     : "continuous" (default) or "oneshot"
+        #                        oneshot = plain SJF (compute n_cached once)
+        #   VLLM_CSJF_VERBOSE  : "1" to log reorder decisions
+        self._csjf_fairness = float(
+            os.environ.get("VLLM_CSJF_FAIRNESS", "500"))
+        self._csjf_mode = os.environ.get("VLLM_CSJF_MODE",
+                                         "continuous").lower()
+        self._csjf_verbose = os.environ.get("VLLM_CSJF_VERBOSE", "0") == "1"
+        if self.policy == SchedulingPolicy.CSJF:
+            logger.info(
+                "CSJF scheduler enabled (PrefillOnly, SOSP'25): "
+                "fairness=%s, mode=%s, verbose=%s",
+                self._csjf_fairness,
+                self._csjf_mode,
+                self._csjf_verbose,
+            )
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -175,6 +200,68 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+    # ------------------------------------------------------------------
+    # CSJF scheduling (PrefillOnly, SOSP'25, Algorithm 1)
+    # ------------------------------------------------------------------
+    def _csjf_num_cached_tokens(self, request: Request) -> int:
+        """
+        Return the number of prefix-cache-hit tokens for `request` against
+        the current KV cache state. Falls back to 0 on any error (e.g.
+        block_hashes not yet populated for a freshly arrived request) so
+        the cost function silently degrades to "assume worst case" for
+        that request on this step.
+
+        Note: `get_computed_blocks` is idempotent; calling it here and
+        again inside the WAITING loop does no harm beyond a minor double-
+        count in prefix_cache_stats (only relevant when log_stats=True).
+        """
+        try:
+            _, n_cached = self.kv_cache_manager.get_computed_blocks(request)
+            return int(n_cached)
+        except Exception:
+            return 0
+
+    def _csjf_cost(self, request: Request, now: float) -> float:
+        """
+        Paper Alg. 1 line 10, using `(n_input - n_cached)` as the proxy
+        for prefill time (paper §6.3):
+            score = (n_input - n_cached) - lambda * t_queue
+        Smaller = served first.
+        """
+        n_input = request.num_tokens
+        if self._csjf_mode == "oneshot":
+            cached = getattr(request, "_csjf_cached_n", None)
+            if cached is None:
+                cached = self._csjf_num_cached_tokens(request)
+                request._csjf_cached_n = cached  # type: ignore[attr-defined]
+        else:
+            cached = self._csjf_num_cached_tokens(request)
+        return ((n_input - cached)
+                - self._csjf_fairness * (now - request.arrival_time))
+
+    def _reorder_waiting_csjf(self) -> None:
+        """
+        O(n) scan of the waiting queue; rotate the deque so the minimum-cost
+        request is at index 0. Assumes `self.waiting` is a CSJFRequestQueue
+        (deque subclass) and has >= 2 elements.
+        """
+        q = self.waiting
+        now = time.time()
+        min_i = 0
+        min_cost = self._csjf_cost(q[0], now)
+        for i in range(1, len(q)):
+            c = self._csjf_cost(q[i], now)
+            if c < min_cost:
+                min_cost = c
+                min_i = i
+        if min_i != 0:
+            q.rotate(-min_i)
+        if self._csjf_verbose:
+            head = q[0]
+            logger.info(
+                "[CSJF] head=%s n_input=%d cost=%.1f queue_len=%d",
+                head.request_id, head.num_tokens, min_cost, len(q))
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -330,6 +417,16 @@ class Scheduler(SchedulerInterface):
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
+
+        # CSJF (PrefillOnly, SOSP'25): re-order the waiting queue in place so
+        # that the request with the smallest cost is at the head. This has to
+        # happen *after* preempted requests have been prepended (because they
+        # legitimately re-enter the waiting queue) and *before* the main
+        # WAITING loop consumes the queue head.
+        if (self.policy == SchedulingPolicy.CSJF
+                and isinstance(self.waiting, CSJFRequestQueue)
+                and len(self.waiting) > 1):
+            self._reorder_waiting_csjf()
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs:

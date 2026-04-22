@@ -18,7 +18,7 @@ from vllm.utils import (DEFAULT_MAX_NUM_BATCHED_TOKENS,
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "csjf"]
 
 
 @config
@@ -109,7 +109,14 @@ class SchedulerConfig:
     - "fcfs" means first come first served, i.e. requests are handled in order
     of arrival.\n
     - "priority" means requests are handled based on given priority (lower
-    value means earlier handling) and time of arrival deciding any ties)."""
+    value means earlier handling) and time of arrival deciding any ties).\n
+    - "csjf" (continuous shortest job first) implements PrefillOnly's
+    shortest-prefill-first scheduler (Du et al., SOSP'25). At every
+    scheduling step the waiting queue is re-ordered by
+    `score = (n_input - n_cached) - lambda * t_queue` so that the request
+    with the shortest *remaining* prefill is served next, subject to a
+    queue-time fairness term (`lambda` defaults to 500, overridable via
+    the VLLM_CSJF_FAIRNESS env var)."""
 
     chunked_prefill_enabled: bool = field(init=False)
     """True if chunked prefill is enabled."""

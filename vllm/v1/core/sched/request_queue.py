@@ -16,6 +16,11 @@ class SchedulingPolicy(Enum):
     """Enum for scheduling policies."""
     FCFS = "fcfs"
     PRIORITY = "priority"
+    # Continuous Shortest-Job-First (PrefillOnly, SOSP'25).
+    # Uses a deque-backed FCFS queue but the Scheduler re-orders it on
+    # every scheduling step via a cost function that combines prefill-time
+    # estimate and queue-time fairness. See Scheduler._reorder_waiting_csjf.
+    CSJF = "csjf"
 
 
 class RequestQueue(ABC):
@@ -214,10 +219,31 @@ class PriorityRequestQueue(RequestQueue):
         return reversed(list(self))
 
 
+class CSJFRequestQueue(FCFSRequestQueue):
+    """
+    Continuous Shortest-Job-First queue (PrefillOnly, SOSP'25).
+
+    Structurally this is identical to `FCFSRequestQueue` (a `deque` subclass)
+    so we retain cheap O(1) push/pop/rotate and O(1) random access. The
+    actual CSJF reordering is performed by `Scheduler.schedule()` by calling
+    `deque.rotate()` to move the minimum-cost request to the head before
+    each scheduling pass. Keeping the deque API means we also get all of
+    vLLM's existing invariants (preempted requests `prepend_request`ed to
+    the head, skipped-request temporary queues, etc.) for free.
+
+    A distinct subclass (rather than reusing `FCFSRequestQueue` directly)
+    is used as a type marker so the scheduler knows whether to perform
+    CSJF reordering without having to look at `scheduler_config.policy`
+    in the hot path.
+    """
+
+
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
+    elif policy == SchedulingPolicy.CSJF:
+        return CSJFRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
     else:
